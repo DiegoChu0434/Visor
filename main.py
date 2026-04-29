@@ -9,6 +9,7 @@ import gpxpy
 import gpxpy.gpx
 import math
 import io
+import csv
 from datetime import datetime, timedelta
 import os
 
@@ -16,7 +17,7 @@ import os
 app = FastAPI(
     title="StreetViewer API",
     description="API para el visor geoespacial 360° de inspección vial.",
-    version="1.1.0",
+    version="1.3.0",
 )
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
@@ -58,16 +59,23 @@ class MatrizRequest(BaseModel):
     postes: list[Poste]
 
 
-class BuscarUTMRequest(BaseModel):
-    x: float
-    y: float
+class AsistidoRequest(BaseModel):
+    current_time: float
     postes: list[Poste]
 
 
 def parse_matriz_body(body_raw: str) -> MatrizRequest:
     try:
-        # Pydantic v2
         return MatrizRequest.model_validate_json(body_raw)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
+    except Exception:
+        raise HTTPException(status_code=422, detail="El campo 'body' no contiene JSON válido.")
+
+
+def parse_asistido_body(body_raw: str) -> AsistidoRequest:
+    try:
+        return AsistidoRequest.model_validate_json(body_raw)
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors())
     except Exception:
@@ -115,7 +123,6 @@ def project_point_on_segment(p, p1, p2):
 def closest_point_on_polyline(lat, lng, coords_wgs84: list[tuple]) -> tuple:
     if len(coords_wgs84) < 2:
         return coords_wgs84[0], 0.0
-
     best_pt = coords_wgs84[0]
     best_dist = float("inf")
     for i in range(len(coords_wgs84) - 1):
@@ -141,17 +148,12 @@ def parse_coordinate_token(token: str) -> Optional[tuple[float, float, float]]:
 
 
 def parse_route_coords_from_kml(kml_text: str) -> list[dict]:
-    """
-    Toma solo LineString para evitar ruido de otros geometrías.
-    Si hay varias, usa la más larga.
-    """
     try:
         root = ET.fromstring(kml_text)
     except ET.ParseError:
         raise HTTPException(422, "KML inválido (no se pudo parsear XML).")
 
     candidate_lines: list[list[dict]] = []
-
     for coords_el in root.findall(".//{*}LineString/{*}coordinates"):
         if not coords_el.text:
             continue
@@ -178,9 +180,6 @@ def parse_route_coords_from_kml(kml_text: str) -> list[dict]:
 
 
 def parse_poste_points_from_kml(kml_text: str) -> list[dict]:
-    """
-    Toma SOLO Placemark/Point para evitar círculos y multi-geometrías.
-    """
     try:
         root = ET.fromstring(kml_text)
     except ET.ParseError:
@@ -188,17 +187,14 @@ def parse_poste_points_from_kml(kml_text: str) -> list[dict]:
 
     out = []
     idx = 1
-
     for pm in root.findall(".//{*}Placemark"):
         coord_el = pm.find(".//{*}Point/{*}coordinates")
         if coord_el is None or not coord_el.text:
             continue
-
         first_token = coord_el.text.strip().split()[0]
         parsed = parse_coordinate_token(first_token)
         if parsed is None:
             continue
-
         lng, lat, _ = parsed
         out.append({"id": idx, "lat": lat, "lng": lng})
         idx += 1
@@ -229,9 +225,6 @@ def nearest_route_index(lat: float, lng: float, route_coords: list[dict]) -> int
 
 
 def maybe_reverse_route_by_times(postes: list[Poste], route_coords: list[dict]) -> list[dict]:
-    """
-    Si los tiempos crecientes caen en distancia decreciente, invierte la ruta.
-    """
     if len(postes) < 2 or len(route_coords) < 2:
         return route_coords
 
@@ -240,13 +233,11 @@ def maybe_reverse_route_by_times(postes: list[Poste], route_coords: list[dict]) 
 
     first_lat, first_lng = utm_to_wgs84(ordered[0].x, ordered[0].y)
     last_lat, last_lng = utm_to_wgs84(ordered[-1].x, ordered[-1].y)
-
     first_idx = nearest_route_index(first_lat, first_lng, route_coords)
     last_idx = nearest_route_index(last_lat, last_lng, route_coords)
 
     if cum_dist[last_idx] < cum_dist[first_idx]:
         reversed_route = list(reversed(route_coords))
-        # reindex
         for i, p in enumerate(reversed_route):
             p["index"] = i
         return reversed_route
@@ -292,11 +283,42 @@ def interpolate_time_on_route(postes: list[Poste], route_coords: list[dict]) -> 
     return enriched
 
 
+def find_poste_asistido(current_time: float, postes: list[Poste], ruta_coords: list[dict]) -> int:
+    if not postes:
+        raise HTTPException(400, "No hay postes para sugerir.")
+
+    calibrados = [p for p in postes if p.time > 0]
+    sin_calibrar = [p for p in postes if p.time <= 0]
+
+    if not sin_calibrar:
+        raise HTTPException(400, "Todos los postes ya están calibrados.")
+
+    if len(calibrados) < 2 or len(ruta_coords) < 2:
+        return sin_calibrar[0].id
+
+    ruta_tiempo = interpolate_time_on_route(calibrados, ruta_coords)
+    if not ruta_tiempo:
+        return sin_calibrar[0].id
+
+    best_pt = min(ruta_tiempo, key=lambda r: abs(r["tiempo_video_s"] - current_time))
+
+    best_id = sin_calibrar[0].id
+    best_dist = float("inf")
+    for p in sin_calibrar:
+        lat_p, lng_p = utm_to_wgs84(p.x, p.y)
+        d = haversine_m(lat_p, lng_p, best_pt["lat"], best_pt["lng"])
+        if d < best_dist:
+            best_dist = d
+            best_id = p.id
+
+    return best_id
+
+
 @app.get("/", tags=["Info"])
 def root():
     return {
         "api": "StreetViewer Geo-Espacial",
-        "version": "1.1.0",
+        "version": "1.3.0",
         "utm_zona": "18 Sur (EPSG:32718)",
         "datum": "WGS84",
     }
@@ -330,8 +352,8 @@ def convertir_wgs84_a_utm(coord: CoordWGS84):
 async def parsear_kml_ruta(file: UploadFile = File(...)):
     content = await file.read()
     kml_text = decode_upload(content)
-
     puntos = parse_route_coords_from_kml(kml_text)
+
     if not puntos:
         raise HTTPException(422, "No se encontraron LineString/coordinates válidas en la ruta.")
 
@@ -380,12 +402,25 @@ async def parsear_kml_postes(file_postes: UploadFile = File(...), file_eje: Uplo
     return {"postes": postes_out}
 
 
+@app.post("/asistido/sugerir-poste", tags=["Asistido"])
+async def sugerir_poste_asistido(body: str = Form(...), file_eje: UploadFile = File(...)):
+    payload = parse_asistido_body(body)
+    content = decode_upload(await file_eje.read())
+    ruta_coords = parse_route_coords_from_kml(content)
+
+    if not ruta_coords:
+        raise HTTPException(422, "Eje inválido: no se encontró una LineString válida.")
+
+    poste_id = find_poste_asistido(payload.current_time, payload.postes, ruta_coords)
+    return {"poste_id": poste_id}
+
+
 @app.post("/matriz/generar", tags=["Matriz"])
 async def generar_matriz(body: str = Form(...), file_eje: UploadFile = File(...)):
     payload = parse_matriz_body(body)
-
     content = decode_upload(await file_eje.read())
     ruta_coords = parse_route_coords_from_kml(content)
+
     if not ruta_coords:
         raise HTTPException(422, "Eje inválido: no se encontró una LineString válida.")
 
@@ -397,32 +432,12 @@ async def generar_matriz(body: str = Form(...), file_eje: UploadFile = File(...)
     return {"puntos": enriquecidos}
 
 
-@app.post("/exportar/json", tags=["Exportación"])
-async def exportar_json(body: str = Form(...), file_eje: UploadFile = File(...)):
-    payload = parse_matriz_body(body)
-
-    content = decode_upload(await file_eje.read())
-    ruta_coords = parse_route_coords_from_kml(content)
-    if not ruta_coords:
-        raise HTTPException(422, "Eje inválido: no se encontró una LineString válida.")
-
-    postes_validos = sorted([p for p in payload.postes if p.time > 0], key=lambda p: p.time)
-    enriquecidos = interpolate_time_on_route(postes_validos, ruta_coords)
-
-    doc = {
-        "metadata": {"generado_en": datetime.utcnow().isoformat()},
-        "postes": [p.model_dump() for p in payload.postes],
-        "ruta": enriquecidos,
-    }
-    return JSONResponse(content=doc)
-
-
 @app.post("/exportar/gpx", tags=["Exportación"])
 async def exportar_gpx(body: str = Form(...), file_eje: UploadFile = File(...)):
     payload = parse_matriz_body(body)
-
     content = decode_upload(await file_eje.read())
     ruta_coords = parse_route_coords_from_kml(content)
+
     if not ruta_coords:
         raise HTTPException(422, "Eje inválido: no se encontró una LineString válida.")
 
@@ -450,4 +465,32 @@ async def exportar_gpx(body: str = Form(...), file_eje: UploadFile = File(...)):
         io.BytesIO(gpx.to_xml().encode("utf-8")),
         media_type="application/gpx+xml",
         headers={"Content-Disposition": 'attachment; filename="ruta.gpx"'},
+    )
+
+
+@app.post("/exportar/csv-postes", tags=["Exportación"])
+async def exportar_csv_postes(body: str = Form(...)):
+    payload = parse_matriz_body(body)
+
+    postes = sorted(payload.postes, key=lambda p: p.time if p.time > 0 else float("inf"))
+    calibrados = [p for p in postes if p.time > 0]
+    source = calibrados if calibrados else postes
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Latitud", "Longitud", "Tiempo", "track"])
+
+    t0 = datetime(2000, 1, 1)
+    for idx, p in enumerate(source, start=1):
+        lat, lng = utm_to_wgs84(p.x, p.y)
+        ts = (t0 + timedelta(seconds=float(p.time))).isoformat() + "Z"
+        writer.writerow([round(lat, 7), round(lng, 7), ts, idx])
+
+    content = output.getvalue()
+    output.close()
+
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="postes_calibrados.csv"'},
     )
