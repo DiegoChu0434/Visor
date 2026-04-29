@@ -10,7 +10,7 @@ import gpxpy.gpx
 import math
 import io
 import csv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 
 
@@ -99,39 +99,13 @@ def wgs84_to_utm(lat: float, lng: float) -> tuple[float, float]:
     return x, y
 
 
-def haversine_m(lat1, lng1, lat2, lng2) -> float:
+def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     r = 6_371_000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlng = math.radians(lng2 - lng1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlng / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
-
-
-def project_point_on_segment(p, p1, p2):
-    ax, ay = p
-    bx, by = p1
-    cx, cy = p2
-    dx, dy = cx - bx, cy - by
-    len_sq = dx * dx + dy * dy
-    if len_sq == 0:
-        return p1
-    t = max(0, min(1, ((ax - bx) * dx + (ay - by) * dy) / len_sq))
-    return bx + t * dx, by + t * dy
-
-
-def closest_point_on_polyline(lat, lng, coords_wgs84: list[tuple]) -> tuple:
-    if len(coords_wgs84) < 2:
-        return coords_wgs84[0], 0.0
-    best_pt = coords_wgs84[0]
-    best_dist = float("inf")
-    for i in range(len(coords_wgs84) - 1):
-        proj = project_point_on_segment((lat, lng), coords_wgs84[i], coords_wgs84[i + 1])
-        d = haversine_m(lat, lng, proj[0], proj[1])
-        if d < best_dist:
-            best_dist = d
-            best_pt = proj
-    return best_pt, best_dist
 
 
 def parse_coordinate_token(token: str) -> Optional[tuple[float, float, float]]:
@@ -212,75 +186,181 @@ def parse_poste_points_from_kml(kml_text: str) -> list[dict]:
     return out
 
 
-def build_cumulative_distance(route_coords: list[dict]) -> list[float]:
-    cum_dist = [0.0]
-    for i in range(1, len(route_coords)):
-        d = haversine_m(
-            route_coords[i - 1]["lat"], route_coords[i - 1]["lng"],
-            route_coords[i]["lat"], route_coords[i]["lng"]
+def build_route_geometry(route_coords: list[dict]) -> list[dict]:
+    geometry = []
+    cumulative = 0.0
+
+    for i, point in enumerate(route_coords):
+        x, y = wgs84_to_utm(point["lat"], point["lng"])
+        if i > 0:
+            prev = geometry[-1]
+            cumulative += math.hypot(x - prev["x"], y - prev["y"])
+        geometry.append(
+            {
+                "index": i,
+                "lat": point["lat"],
+                "lng": point["lng"],
+                "alt": point.get("alt", 0.0),
+                "x": x,
+                "y": y,
+                "cum_dist": cumulative,
+            }
         )
-        cum_dist.append(cum_dist[-1] + d)
-    return cum_dist
+
+    return geometry
 
 
-def nearest_route_index(lat: float, lng: float, route_coords: list[dict]) -> int:
-    min_d = float("inf")
-    best_idx = 0
-    for i, c in enumerate(route_coords):
-        d = haversine_m(lat, lng, c["lat"], c["lng"])
-        if d < min_d:
-            min_d = d
-            best_idx = i
-    return best_idx
+def project_point_on_segment_utm(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> tuple[float, float, float]:
+    dx = bx - ax
+    dy = by - ay
+    len_sq = dx * dx + dy * dy
+    if len_sq == 0:
+        return ax, ay, 0.0
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / len_sq))
+    return ax + t * dx, ay + t * dy, t
+
+
+def project_point_on_route_utm(px: float, py: float, route_geometry: list[dict]) -> dict:
+    if len(route_geometry) < 2:
+        first = route_geometry[0]
+        return {
+            "x": first["x"],
+            "y": first["y"],
+            "route_distance": 0.0,
+            "distance_to_route": math.hypot(px - first["x"], py - first["y"]),
+            "segment_index": 0,
+            "lat": first["lat"],
+            "lng": first["lng"],
+        }
+
+    best = None
+    min_dist = float("inf")
+
+    for i in range(len(route_geometry) - 1):
+        a = route_geometry[i]
+        b = route_geometry[i + 1]
+        sx, sy, t = project_point_on_segment_utm(px, py, a["x"], a["y"], b["x"], b["y"])
+        dist = math.hypot(px - sx, py - sy)
+        segment_len = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+        route_distance = a["cum_dist"] + segment_len * t
+
+        if dist < min_dist:
+            min_dist = dist
+            best = {
+                "x": sx,
+                "y": sy,
+                "route_distance": route_distance,
+                "distance_to_route": dist,
+                "segment_index": i,
+            }
+
+    if best is None:
+        first = route_geometry[0]
+        return {
+            "x": first["x"],
+            "y": first["y"],
+            "route_distance": 0.0,
+            "distance_to_route": math.hypot(px - first["x"], py - first["y"]),
+            "segment_index": 0,
+        }
+
+    best_lat, best_lng = utm_to_wgs84(best["x"], best["y"])
+    best["lat"] = best_lat
+    best["lng"] = best_lng
+    return best
+
+
+def closest_point_on_polyline(lat: float, lng: float, route_coords: list[dict]) -> tuple[tuple[float, float], float]:
+    if not route_coords:
+        return (lat, lng), 0.0
+
+    if len(route_coords) < 2:
+        first = route_coords[0]
+        return (first["lat"], first["lng"]), 0.0
+
+    route_geometry = build_route_geometry(route_coords)
+    px, py = wgs84_to_utm(lat, lng)
+    projected = project_point_on_route_utm(px, py, route_geometry)
+    return (projected["lat"], projected["lng"]), projected["distance_to_route"]
+
+
+def build_cumulative_distance(route_coords: list[dict]) -> list[float]:
+    route_geometry = build_route_geometry(route_coords)
+    return [point["cum_dist"] for point in route_geometry]
 
 
 def maybe_reverse_route_by_times(postes: list[Poste], route_coords: list[dict]) -> list[dict]:
     if len(postes) < 2 or len(route_coords) < 2:
         return route_coords
 
-    ordered = sorted(postes, key=lambda p: p.time)
-    cum_dist = build_cumulative_distance(route_coords)
+    calibrated = sorted([p for p in postes if p.time > 0], key=lambda p: p.time)
+    if len(calibrated) < 2:
+        return route_coords
 
-    first_lat, first_lng = utm_to_wgs84(ordered[0].x, ordered[0].y)
-    last_lat, last_lng = utm_to_wgs84(ordered[-1].x, ordered[-1].y)
-    first_idx = nearest_route_index(first_lat, first_lng, route_coords)
-    last_idx = nearest_route_index(last_lat, last_lng, route_coords)
+    route_geometry = build_route_geometry(route_coords)
+    first_x, first_y = calibrated[0].x, calibrated[0].y
+    last_x, last_y = calibrated[-1].x, calibrated[-1].y
+    first_proj = project_point_on_route_utm(first_x, first_y, route_geometry)
+    last_proj = project_point_on_route_utm(last_x, last_y, route_geometry)
 
-    if cum_dist[last_idx] < cum_dist[first_idx]:
-        reversed_route = list(reversed(route_coords))
-        for i, p in enumerate(reversed_route):
-            p["index"] = i
-        return reversed_route
+    if last_proj["route_distance"] < first_proj["route_distance"]:
+        return list(reversed(route_coords))
 
     return route_coords
 
 
 def interpolate_time_on_route(postes: list[Poste], route_coords: list[dict]) -> list[dict]:
     if not postes or len(postes) < 2 or len(route_coords) < 2:
-        return route_coords
+        return [
+            {**point, "tiempo_video_s": 0.0}
+            for point in route_coords
+        ]
 
     route_coords = maybe_reverse_route_by_times(postes, route_coords)
-    cum_dist = build_cumulative_distance(route_coords)
+    route_geometry = build_route_geometry(route_coords)
 
     anchors = []
-    for poste in sorted(postes, key=lambda p: p.time):
-        lat_p, lng_p = utm_to_wgs84(poste.x, poste.y)
-        idx = nearest_route_index(lat_p, lng_p, route_coords)
-        anchors.append({"route_idx": idx, "cum_dist": cum_dist[idx], "time": poste.time})
+    for poste in sorted([p for p in postes if p.time > 0], key=lambda p: p.time):
+        px, py = wgs84_to_utm(*utm_to_wgs84(poste.x, poste.y))
+        projected = project_point_on_route_utm(px, py, route_geometry)
+        anchors.append(
+            {
+                "route_distance": projected["route_distance"],
+                "time": poste.time,
+                "lat": projected["lat"],
+                "lng": projected["lng"],
+            }
+        )
 
-    anchors.sort(key=lambda a: a["cum_dist"])
+    if len(anchors) < 2:
+        return [
+            {**point, "tiempo_video_s": round(anchors[0]["time"], 4) if anchors else 0.0}
+            for point in route_geometry
+        ]
+
+    anchors.sort(key=lambda a: a["route_distance"])
+
+    deduped = []
+    for anchor in anchors:
+        if not deduped or abs(anchor["route_distance"] - deduped[-1]["route_distance"]) > 1e-9:
+            deduped.append(anchor)
+        else:
+            deduped[-1] = anchor
 
     enriched = []
-    for i, pt in enumerate(route_coords):
-        d = cum_dist[i]
-        before = [a for a in anchors if a["cum_dist"] <= d]
-        after = [a for a in anchors if a["cum_dist"] > d]
+    for point in route_geometry:
+        d = point["cum_dist"]
+        before = [a for a in deduped if a["route_distance"] <= d]
+        after = [a for a in deduped if a["route_distance"] > d]
 
         if before and after:
             a0 = before[-1]
             a1 = after[0]
-            span = a1["cum_dist"] - a0["cum_dist"]
-            t = a0["time"] + (d - a0["cum_dist"]) / span * (a1["time"] - a0["time"]) if span > 0 else a0["time"]
+            span = a1["route_distance"] - a0["route_distance"]
+            if span > 0:
+                t = a0["time"] + (d - a0["route_distance"]) * (a1["time"] - a0["time"]) / span
+            else:
+                t = a0["time"]
         elif before:
             t = before[-1]["time"]
         elif after:
@@ -288,9 +368,47 @@ def interpolate_time_on_route(postes: list[Poste], route_coords: list[dict]) -> 
         else:
             t = 0.0
 
-        enriched.append({**pt, "tiempo_video_s": round(t, 4)})
+        enriched.append(
+            {
+                "index": point["index"],
+                "lat": point["lat"],
+                "lng": point["lng"],
+                "alt": point["alt"],
+                "dist_acum_m": round(point["cum_dist"], 3),
+                "tiempo_video_s": round(t, 4),
+            }
+        )
 
     return enriched
+
+
+def build_track_export_payload(postes: list[Poste], ruta_coords: list[dict]) -> list[dict]:
+    enriched = interpolate_time_on_route(postes, ruta_coords)
+    track = []
+    base = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    for idx, point in enumerate(enriched, start=1):
+        dt = base + timedelta(seconds=float(point.get("tiempo_video_s", 0.0)))
+        track.append(
+            {
+                "track": idx,
+                "latitud": round(point["lat"], 8),
+                "longitud": round(point["lng"], 8),
+                "fecha": dt.date().isoformat(),
+                "hora_ms": dt.strftime("%H:%M:%S.%f")[:-3],
+                "timestamp_iso": dt.isoformat().replace("+00:00", "Z"),
+                "tiempo_video_s": round(float(point.get("tiempo_video_s", 0.0)), 4),
+            }
+        )
+
+    return track
+
+
+def nearest_route_index(lat: float, lng: float, route_coords: list[dict]) -> int:
+    route_geometry = build_route_geometry(route_coords)
+    px, py = wgs84_to_utm(lat, lng)
+    projected = project_point_on_route_utm(px, py, route_geometry)
+    return projected["segment_index"]
 
 
 def find_poste_asistido(current_time: float, postes: list[Poste], ruta_coords: list[dict]) -> int:
@@ -392,22 +510,24 @@ async def parsear_kml_postes(file_postes: UploadFile = File(...), file_eje: Uplo
     if not poste_points:
         raise HTTPException(422, "No se encontraron coordenadas en el KML de postes.")
 
-    route_latlng = [(p["lat"], p["lng"]) for p in ruta_coords]
+    route_geometry = build_route_geometry(ruta_coords)
     postes_out = []
 
     for p in poste_points:
         lat_p, lng_p = p["lat"], p["lng"]
         x_utm, y_utm = wgs84_to_utm(lat_p, lng_p)
-        proj_pt, dist_eje = closest_point_on_polyline(lat_p, lng_p, route_latlng)
+        projected = project_point_on_route_utm(x_utm, y_utm, route_geometry)
 
-        postes_out.append({
-            "id": p["id"],
-            "wgs84": {"lat": round(lat_p, 8), "lng": round(lng_p, 8)},
-            "utm": {"x_este": round(x_utm, 3), "y_norte": round(y_utm, 3)},
-            "proyectado_en_eje": {"lat": round(proj_pt[0], 8), "lng": round(proj_pt[1], 8)},
-            "distancia_al_eje_m": round(dist_eje, 3),
-            "time": 0.0,
-        })
+        postes_out.append(
+            {
+                "id": p["id"],
+                "wgs84": {"lat": round(lat_p, 8), "lng": round(lng_p, 8)},
+                "utm": {"x_este": round(x_utm, 3), "y_norte": round(y_utm, 3)},
+                "proyectado_en_eje": {"lat": round(projected["lat"], 8), "lng": round(projected["lng"], 8)},
+                "distancia_al_eje_m": round(projected["distance_to_route"], 3),
+                "time": 0.0,
+            }
+        )
 
     return {"postes": postes_out}
 
@@ -442,6 +562,22 @@ async def generar_matriz(body: str = Form(...), file_eje: UploadFile = File(...)
     return {"puntos": enriquecidos}
 
 
+@app.post("/exportar/json", tags=["Exportación"])
+async def exportar_json(body: str = Form(...), file_eje: UploadFile = File(...)):
+    payload = parse_matriz_body(body)
+    content = decode_upload(await file_eje.read())
+    ruta_coords = parse_route_coords_from_kml(content)
+
+    if not ruta_coords:
+        raise HTTPException(422, "Eje inválido: no se encontró una LineString válida.")
+
+    postes_validos = [p for p in payload.postes if p.time > 0]
+    if len(postes_validos) < 2:
+        raise HTTPException(400, "Faltan postes calibrados (mínimo 2 con tiempo > 0).")
+
+    return {"puntos": interpolate_time_on_route(postes_validos, ruta_coords)}
+
+
 @app.post("/exportar/gpx", tags=["Exportación"])
 async def exportar_gpx(body: str = Form(...), file_eje: UploadFile = File(...)):
     payload = parse_matriz_body(body)
@@ -460,7 +596,7 @@ async def exportar_gpx(body: str = Form(...), file_eje: UploadFile = File(...)):
     segment = gpxpy.gpx.GPXTrackSegment()
     track.segments.append(segment)
 
-    t0 = datetime(2000, 1, 1)
+    t0 = datetime(2000, 1, 1, tzinfo=timezone.utc)
     for pt in enriquecidos:
         segment.points.append(
             gpxpy.gpx.GPXTrackPoint(
@@ -482,19 +618,34 @@ async def exportar_gpx(body: str = Form(...), file_eje: UploadFile = File(...)):
 async def exportar_csv_postes(body: str = Form(...)):
     payload = parse_matriz_body(body)
 
-    postes = sorted(payload.postes, key=lambda p: p.time if p.time > 0 else float("inf"))
-    calibrados = [p for p in postes if p.time > 0]
-    source = calibrados if calibrados else postes
+    postes_validos = [p for p in payload.postes if p.time > 0]
+    source = sorted(
+        postes_validos if postes_validos else payload.postes,
+        key=lambda p: (p.time if p.time > 0 else float("inf"), p.id),
+    )
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Latitud", "Longitud", "Tiempo", "track"])
+    writer.writerow(["track", "poste_id", "latitud", "longitud", "fecha", "hora_ms", "timestamp_iso"])
 
-    t0 = datetime(2000, 1, 1)
+    base = datetime(2000, 1, 1, tzinfo=timezone.utc)
     for idx, p in enumerate(source, start=1):
         lat, lng = utm_to_wgs84(p.x, p.y)
-        ts = (t0 + timedelta(seconds=float(p.time))).isoformat() + "Z"
-        writer.writerow([round(lat, 7), round(lng, 7), ts, idx])
+        dt = base + timedelta(seconds=float(p.time))
+        fecha = dt.date().isoformat()
+        hora_ms = dt.strftime("%H:%M:%S.%f")[:-3]
+        timestamp_iso = dt.isoformat().replace("+00:00", "Z")
+        writer.writerow(
+            [
+                idx,
+                p.id,
+                round(lat, 8),
+                round(lng, 8),
+                fecha,
+                hora_ms,
+                timestamp_iso,
+            ]
+        )
 
     content = output.getvalue()
     output.close()
@@ -502,5 +653,5 @@ async def exportar_csv_postes(body: str = Form(...)):
     return StreamingResponse(
         io.BytesIO(content.encode("utf-8")),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="postes_calibrados.csv"'},
+        headers={"Content-Disposition": 'attachment; filename="track_calibrado.csv"'},
     )
