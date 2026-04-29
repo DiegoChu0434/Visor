@@ -185,20 +185,42 @@ def parse_poste_points_from_kml(kml_text: str) -> list[dict]:
     except ET.ParseError:
         raise HTTPException(422, "KML de postes inválido (no se pudo parsear XML).")
 
-    out = []
-    idx = 1
+    points: list[tuple[float, float]] = []
+
     for pm in root.findall(".//{*}Placemark"):
         coord_el = pm.find(".//{*}Point/{*}coordinates")
-        if coord_el is None or not coord_el.text:
+        if coord_el is not None and coord_el.text:
+            first_token = coord_el.text.strip().split()[0]
+            parsed = parse_coordinate_token(first_token)
+            if parsed is not None:
+                lng, lat, _ = parsed
+                points.append((lat, lng))
             continue
-        first_token = coord_el.text.strip().split()[0]
-        parsed = parse_coordinate_token(first_token)
-        if parsed is None:
-            continue
-        lng, lat, _ = parsed
-        out.append({"id": idx, "lat": lat, "lng": lng})
-        idx += 1
 
+        coord_el2 = pm.find(".//{*}coordinates")
+        if coord_el2 is not None and coord_el2.text:
+            tokens = coord_el2.text.strip().split()
+            if tokens:
+                parsed = parse_coordinate_token(tokens[0])
+                if parsed is not None:
+                    lng, lat, _ = parsed
+                    points.append((lat, lng))
+
+    if not points:
+        return []
+
+    uniq: list[tuple[float, float]] = []
+    seen = set()
+    for lat, lng in points:
+        key = (round(lat, 8), round(lng, 8))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((lat, lng))
+
+    out = []
+    for i, (lat, lng) in enumerate(uniq, start=1):
+        out.append({"id": i, "lat": lat, "lng": lng})
     return out
 
 
