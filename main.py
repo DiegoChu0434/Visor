@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ValidationError
 from typing import Optional
 import xml.etree.ElementTree as ET
@@ -17,7 +17,7 @@ import os
 app = FastAPI(
     title="StreetViewer API",
     description="API para el visor geoespacial 360° de inspección vial.",
-    version="1.3.0",
+    version="1.3.1",
 )
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
@@ -206,20 +206,8 @@ def parse_poste_points_from_kml(kml_text: str) -> list[dict]:
                     lng, lat, _ = parsed
                     points.append((lat, lng))
 
-    if not points:
-        return []
-
-    uniq: list[tuple[float, float]] = []
-    seen = set()
-    for lat, lng in points:
-        key = (round(lat, 8), round(lng, 8))
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append((lat, lng))
-
     out = []
-    for i, (lat, lng) in enumerate(uniq, start=1):
+    for i, (lat, lng) in enumerate(points, start=1):
         out.append({"id": i, "lat": lat, "lng": lng})
     return out
 
@@ -340,7 +328,7 @@ def find_poste_asistido(current_time: float, postes: list[Poste], ruta_coords: l
 def root():
     return {
         "api": "StreetViewer Geo-Espacial",
-        "version": "1.3.0",
+        "version": "1.3.1",
         "utm_zona": "18 Sur (EPSG:32718)",
         "datum": "WGS84",
     }
@@ -402,7 +390,7 @@ async def parsear_kml_postes(file_postes: UploadFile = File(...), file_eje: Uplo
 
     poste_points = parse_poste_points_from_kml(content_postes)
     if not poste_points:
-        raise HTTPException(422, "No se encontraron postes tipo Point en el KML de postes.")
+        raise HTTPException(422, "No se encontraron coordenadas en el KML de postes.")
 
     route_latlng = [(p["lat"], p["lng"]) for p in ruta_coords]
     postes_out = []
