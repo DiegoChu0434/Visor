@@ -641,14 +641,7 @@ async def exportar_gpx(
         postes_validos if postes_validos else payload.postes,
         key=lambda p: (p.time if p.time > 0 else float("inf"), p.id),
     )
-    enriquecidos = interpolate_time_on_route(postes_validos, ruta_coords)
-
     gpx = gpxpy.gpx.GPX()
-    track = gpxpy.gpx.GPXTrack()
-    track.name = "Ruta Completa"
-    gpx.tracks.append(track)
-    segment = gpxpy.gpx.GPXTrackSegment()
-    track.segments.append(segment)
 
     for poste in postes_ordenados:
         lat, lng = utm_to_wgs84(poste.x, poste.y)
@@ -661,16 +654,6 @@ async def exportar_gpx(
                 name=str(poste.id),
                 description=f"Hora registrada: {timestamp}",
                 time=dt,
-            )
-        )
-
-    for pt in enriquecidos:
-        segment.points.append(
-            gpxpy.gpx.GPXTrackPoint(
-                pt["lat"],
-                pt["lng"],
-                elevation=pt.get("alt", 0),
-                time=base + timedelta(seconds=pt.get("tiempo_video_s", 0)),
             )
         )
 
