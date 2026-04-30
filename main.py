@@ -621,7 +621,13 @@ async def exportar_json(body: str = Form(...), file_eje: UploadFile = File(...))
 
 
 @app.post("/exportar/gpx", tags=["Exportación"])
-async def exportar_gpx(body: str = Form(...), file_eje: UploadFile = File(...)):
+async def exportar_gpx(
+    body: str = Form(...),
+    file_eje: UploadFile = File(...),
+    video_datetime: Optional[str] = Form(None),
+    video_fecha: Optional[str] = Form(None),
+    video_hora: Optional[str] = Form(None),
+):
     payload = parse_matriz_body(body)
     content = decode_upload(await file_eje.read())
     ruta_coords = parse_route_coords_from_kml(content)
@@ -629,23 +635,42 @@ async def exportar_gpx(body: str = Form(...), file_eje: UploadFile = File(...)):
     if not ruta_coords:
         raise HTTPException(422, "Eje inválido: no se encontró una LineString válida.")
 
-    postes_validos = sorted([p for p in payload.postes if p.time > 0], key=lambda p: p.time)
+    base = parse_video_base_datetime(video_datetime, video_fecha, video_hora)
+    postes_validos = [p for p in payload.postes if p.time > 0]
+    postes_ordenados = sorted(
+        postes_validos if postes_validos else payload.postes,
+        key=lambda p: (p.time if p.time > 0 else float("inf"), p.id),
+    )
     enriquecidos = interpolate_time_on_route(postes_validos, ruta_coords)
 
     gpx = gpxpy.gpx.GPX()
     track = gpxpy.gpx.GPXTrack()
+    track.name = "Ruta Completa"
     gpx.tracks.append(track)
     segment = gpxpy.gpx.GPXTrackSegment()
     track.segments.append(segment)
 
-    t0 = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    for poste in postes_ordenados:
+        lat, lng = utm_to_wgs84(poste.x, poste.y)
+        dt = base + timedelta(seconds=float(poste.time))
+        timestamp = dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        gpx.waypoints.append(
+            gpxpy.gpx.GPXWaypoint(
+                latitude=lat,
+                longitude=lng,
+                name=str(poste.id),
+                description=f"Hora registrada: {timestamp}",
+                time=dt,
+            )
+        )
+
     for pt in enriquecidos:
         segment.points.append(
             gpxpy.gpx.GPXTrackPoint(
                 pt["lat"],
                 pt["lng"],
                 elevation=pt.get("alt", 0),
-                time=t0 + timedelta(seconds=pt.get("tiempo_video_s", 0)),
+                time=base + timedelta(seconds=pt.get("tiempo_video_s", 0)),
             )
         )
 
@@ -677,11 +702,11 @@ async def exportar_csv_postes(
     writer = csv.writer(output)
     writer.writerow(["Latitud", "Longitud", "Tiempo", "track"])
 
-    for idx, p in enumerate(source, start=1):
+    for p in source:
         lat, lng = utm_to_wgs84(p.x, p.y)
         dt = base + timedelta(seconds=float(p.time))
         tiempo = dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
-        writer.writerow([round(lat, 8), round(lng, 8), tiempo, idx])
+        writer.writerow([round(lat, 8), round(lng, 8), tiempo, p.id])
 
     content = output.getvalue()
     output.close()
