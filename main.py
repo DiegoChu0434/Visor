@@ -637,11 +637,14 @@ async def exportar_gpx(
 
     base = parse_video_base_datetime(video_datetime, video_fecha, video_hora)
     postes_validos = [p for p in payload.postes if p.time > 0]
-    postes_ordenados = sorted(
-        postes_validos if postes_validos else payload.postes,
-        key=lambda p: (p.time if p.time > 0 else float("inf"), p.id),
-    )
+    postes_source = postes_validos if postes_validos else payload.postes
+    postes_ordenados = sorted(postes_source, key=lambda p: p.id)
     gpx = gpxpy.gpx.GPX()
+    track = gpxpy.gpx.GPXTrack()
+    track.name = "Postes"
+    gpx.tracks.append(track)
+    segment = gpxpy.gpx.GPXTrackSegment()
+    track.segments.append(segment)
 
     for poste in postes_ordenados:
         lat, lng = utm_to_wgs84(poste.x, poste.y)
@@ -653,6 +656,13 @@ async def exportar_gpx(
                 longitude=lng,
                 name=str(poste.id),
                 description=f"Hora registrada: {timestamp}",
+                time=dt,
+            )
+        )
+        segment.points.append(
+            gpxpy.gpx.GPXTrackPoint(
+                lat,
+                lng,
                 time=dt,
             )
         )
