@@ -13,18 +13,17 @@ import csv
 from datetime import datetime, timedelta, timezone
 import os
 
-
 app = FastAPI(
     title="StreetViewer API",
     description="API para el visor geoespacial 360° de inspección vial.",
-    version="1.3.1",
+    version="1.3.2",
 )
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -285,13 +284,13 @@ def build_cumulative_distance(route_coords: list[dict]) -> list[float]:
     return [point["cum_dist"] for point in route_geometry]
 
 
-def maybe_reverse_route_by_times(postes: list[Poste], route_coords: list[dict]) -> list[dict]:
+def maybe_reverse_route_by_times(postes: list[Poste], route_coords: list[dict]) -> Optional[bool]:
     if len(postes) < 2 or len(route_coords) < 2:
-        return route_coords
+        return None
 
     calibrated = sorted([p for p in postes if p.time > 0], key=lambda p: p.time)
     if len(calibrated) < 2:
-        return route_coords
+        return None
 
     route_geometry = build_route_geometry(route_coords)
     first_x, first_y = calibrated[0].x, calibrated[0].y
@@ -299,26 +298,46 @@ def maybe_reverse_route_by_times(postes: list[Poste], route_coords: list[dict]) 
     first_proj = project_point_on_route_utm(first_x, first_y, route_geometry)
     last_proj = project_point_on_route_utm(last_x, last_y, route_geometry)
 
-    if last_proj["route_distance"] < first_proj["route_distance"]:
-        return list(reversed(route_coords))
+    return last_proj["route_distance"] < first_proj["route_distance"]
 
+
+def maybe_reverse_route_by_poste_ids(postes: list[Poste], route_coords: list[dict]) -> Optional[bool]:
+    if len(postes) < 2 or len(route_coords) < 2:
+        return None
+
+    route_geometry = build_route_geometry(route_coords)
+    ordered = sorted(postes, key=lambda p: p.id)
+    first = ordered[0]
+    last = ordered[-1]
+    first_proj = project_point_on_route_utm(first.x, first.y, route_geometry)
+    last_proj = project_point_on_route_utm(last.x, last.y, route_geometry)
+
+    if abs(last_proj["route_distance"] - first_proj["route_distance"]) < 1e-6:
+        return None
+
+    return last_proj["route_distance"] < first_proj["route_distance"]
+
+
+def maybe_reverse_route(postes: list[Poste], route_coords: list[dict]) -> list[dict]:
+    decision = maybe_reverse_route_by_times(postes, route_coords)
+    if decision is None:
+        decision = maybe_reverse_route_by_poste_ids(postes, route_coords)
+
+    if decision:
+        return list(reversed(route_coords))
     return route_coords
 
 
 def interpolate_time_on_route(postes: list[Poste], route_coords: list[dict]) -> list[dict]:
     if not postes or len(postes) < 2 or len(route_coords) < 2:
-        return [
-            {**point, "tiempo_video_s": 0.0}
-            for point in route_coords
-        ]
+        return [{**point, "tiempo_video_s": 0.0} for point in route_coords]
 
-    route_coords = maybe_reverse_route_by_times(postes, route_coords)
+    route_coords = maybe_reverse_route(postes, route_coords)
     route_geometry = build_route_geometry(route_coords)
 
     anchors = []
     for poste in sorted([p for p in postes if p.time > 0], key=lambda p: p.time):
-        px, py = wgs84_to_utm(*utm_to_wgs84(poste.x, poste.y))
-        projected = project_point_on_route_utm(px, py, route_geometry)
+        projected = project_point_on_route_utm(poste.x, poste.y, route_geometry)
         anchors.append(
             {
                 "route_distance": projected["route_distance"],
@@ -378,10 +397,37 @@ def interpolate_time_on_route(postes: list[Poste], route_coords: list[dict]) -> 
     return enriched
 
 
-def build_track_export_payload(postes: list[Poste], ruta_coords: list[dict]) -> list[dict]:
+def parse_video_base_datetime(
+    video_datetime: Optional[str],
+    video_fecha: Optional[str],
+    video_hora: Optional[str],
+) -> datetime:
+    if video_datetime:
+        s = video_datetime.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            raise HTTPException(422, "video_datetime inválido. Usa ISO 8601, ej: 2026-04-30T11:35:00Z")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    if video_fecha and video_hora:
+        try:
+            dt = datetime.fromisoformat(f"{video_fecha.strip()}T{video_hora.strip()}")
+        except Exception:
+            raise HTTPException(422, "video_fecha/video_hora inválidos. Ej: video_fecha=2026-04-30, video_hora=11:35:00")
+        return dt.replace(tzinfo=timezone.utc)
+
+    return datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
+def build_track_export_payload(postes: list[Poste], ruta_coords: list[dict], base_dt: Optional[datetime] = None) -> list[dict]:
     enriched = interpolate_time_on_route(postes, ruta_coords)
     track = []
-    base = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    base = (base_dt or datetime(2000, 1, 1, tzinfo=timezone.utc)).astimezone(timezone.utc)
 
     for idx, point in enumerate(enriched, start=1):
         dt = base + timedelta(seconds=float(point.get("tiempo_video_s", 0.0)))
@@ -442,7 +488,7 @@ def find_poste_asistido(current_time: float, postes: list[Poste], ruta_coords: l
 def root():
     return {
         "api": "StreetViewer Geo-Espacial",
-        "version": "1.3.1",
+        "version": "1.3.2",
         "utm_zona": "18 Sur (EPSG:32718)",
         "datum": "WGS84",
     }
@@ -611,8 +657,15 @@ async def exportar_gpx(body: str = Form(...), file_eje: UploadFile = File(...)):
 
 
 @app.post("/exportar/csv-postes", tags=["Exportación"])
-async def exportar_csv_postes(body: str = Form(...)):
+async def exportar_csv_postes(
+    body: str = Form(...),
+    video_datetime: Optional[str] = Form(None),
+    video_fecha: Optional[str] = Form(None),
+    video_hora: Optional[str] = Form(None),
+):
     payload = parse_matriz_body(body)
+
+    base = parse_video_base_datetime(video_datetime, video_fecha, video_hora)
 
     postes_validos = [p for p in payload.postes if p.time > 0]
     source = sorted(
@@ -622,26 +675,13 @@ async def exportar_csv_postes(body: str = Form(...)):
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["track", "poste_id", "latitud", "longitud", "fecha", "hora_ms", "timestamp_iso"])
+    writer.writerow(["Latitud", "Longitud", "Tiempo", "track"])
 
-    base = datetime(2000, 1, 1, tzinfo=timezone.utc)
     for idx, p in enumerate(source, start=1):
         lat, lng = utm_to_wgs84(p.x, p.y)
         dt = base + timedelta(seconds=float(p.time))
-        fecha = dt.date().isoformat()
-        hora_ms = dt.strftime("%H:%M:%S.%f")[:-3]
-        timestamp_iso = dt.isoformat().replace("+00:00", "Z")
-        writer.writerow(
-            [
-                idx,
-                p.id,
-                round(lat, 8),
-                round(lng, 8),
-                fecha,
-                hora_ms,
-                timestamp_iso,
-            ]
-        )
+        tiempo = dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        writer.writerow([round(lat, 8), round(lng, 8), tiempo, idx])
 
     content = output.getvalue()
     output.close()
@@ -649,5 +689,5 @@ async def exportar_csv_postes(body: str = Form(...)):
     return StreamingResponse(
         io.BytesIO(content.encode("utf-8")),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="track_calibrado.csv"'},
+        headers={"Content-Disposition": 'attachment; filename="postes_calibrados.csv"'},
     )
