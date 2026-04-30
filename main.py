@@ -24,11 +24,7 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        FRONTEND_URL,
-        "http://localhost:4200",
-        "http://localhost:4300",
-    ],
+    allow_origins=["*"], 
     allow_methods=["*"],
     allow_headers=["*"],
 )
